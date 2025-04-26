@@ -1,0 +1,65 @@
+import traceback
+import pickle
+
+/Users/mojipao/Documents/Software Projects/Datathon /sparcs_analysis.py:120: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+  facility_aggs = df.groupby('Facility Id').agg({
+/Users/mojipao/Documents/Software Projects/Datathon /sparcs_analysis.py:138: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+  drg_aggs = df.groupby('APR DRG Code').agg({
+/Users/mojipao/Documents/Software Projects/Datathon /sparcs_analysis.py:156: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+  severity_aggs = df.groupby('APR Severity of Illness Code').agg({
+
+# Save trained models
+try:
+    print("Saving trained models...")
+    with open('trained_models.pkl', 'wb') as f:
+        pickle.dump({
+            'model_1a': model_1a,
+            'model_1b': model_1b,
+            'model_1c': model_1c,
+            'model_2': model_2,
+            'model_3': model_3
+        }, f)
+    print("Models saved successfully.")
+except Exception as e:
+    print(f"Error saving models: {e}")
+    traceback.print_exc()
+
+# SHAP values for model explanation
+print("\nCalculating SHAP values for model interpretation...")
+
+try:
+    # SHAP for Discharges model
+    print("Calculating SHAP values for discharges model...")
+    # Use a sample to reduce computation
+    sample_size = min(1000, len(X_test_1a))
+    explainer_1a = shap.Explainer(model_1a, X_train_1a.iloc[:sample_size])
+    shap_values_1a = explainer_1a(X_test_1a.iloc[:sample_size])
+    
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values_1a, X_test_1a.iloc[:sample_size], plot_type="bar", show=False)
+    plt.title("SHAP Feature Importance for Discharges Model")
+    plt.tight_layout()
+    plt.savefig('shap_discharges.png')
+    print("SHAP plot for discharges saved.")
+except Exception as e:
+    print(f"Error during SHAP analysis for discharges model: {e}")
+    traceback.print_exc()
+    print("Continuing with next steps...")
+
+try:
+    # SHAP for Mean Cost model
+    print("Calculating SHAP values for mean cost model...")
+    sample_size = min(1000, len(X_test_3))
+    explainer_3 = shap.Explainer(model_3, X_train_3.iloc[:sample_size])
+    shap_values_3 = explainer_3(X_test_3.iloc[:sample_size])
+    
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values_3, X_test_3.iloc[:sample_size], plot_type="bar", show=False)
+    plt.title("SHAP Feature Importance for Mean Cost Model")
+    plt.tight_layout()
+    plt.savefig('shap_mean_cost.png')
+    print("SHAP plot for mean cost saved.")
+except Exception as e:
+    print(f"Error during SHAP analysis for mean cost model: {e}")
+    traceback.print_exc()
+    print("Continuing with next steps...")
