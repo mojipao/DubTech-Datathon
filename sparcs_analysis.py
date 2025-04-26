@@ -8,9 +8,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import shap
+from scipy import sparse
+from sklearn.inspection import permutation_importance
 
 # Set random seed for reproducibility
 np.random.seed(42)
@@ -198,31 +200,159 @@ df['Year_Cat'] = df['Year'].astype('category')
 
 # One-hot encode categorical variables
 print("\nEncoding categorical variables...")
-# Convert categorical columns to strings for one-hot encoding
+# Create separate encoders for each categorical column to avoid creating one huge matrix
+encoded_dfs = []
+encoders = {}
 for col in categorical_cols:
-    if col in df.columns:
-        df[col] = df[col].astype(str)
-
-# Apply one-hot encoding to categorical columns
-encoder = OneHotEncoder(sparse_output=False, drop='first')
-encoded_cats = encoder.fit_transform(df[categorical_cols])
-
-# Get feature names after one-hot encoding
-feature_names = []
-for i, col in enumerate(categorical_cols):
-    categories = encoder.categories_[i][1:]  # Skip the first category (dropped)
-    feature_names.extend([f"{col}_{cat}" for cat in categories])
-
-# Create a DataFrame with the encoded features
-encoded_df = pd.DataFrame(encoded_cats, columns=feature_names, index=df.index)
+    # Use sparse matrices to save memory
+    encoder = OneHotEncoder(sparse_output=True, drop='first', handle_unknown='ignore')
+    encoded = encoder.fit_transform(df[[col]])
+    
+    # Create feature names
+    feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
+    
+    # Keep track of the encoder for future predictions
+    encoders[col] = encoder
+    
+    # Instead of creating a DataFrame, keep as sparse matrix with feature names
+    encoded_dfs.append((encoded, feature_names))
 
 # Save original columns needed for task 2 before encoding
 df_orig = df[['APR DRG Code', 'Year', 'Discharges']].copy()
 
-# Concatenate the original DataFrame with the encoded features
-df = pd.concat([df.drop(categorical_cols, axis=1), encoded_df], axis=1)
+# Create a function to transform data for model input to ensure sparse matrices are preserved
+def prepare_sparse_input(dataframe, feature_cols, categorical_encodings=None, encoders=None):
+    """
+    Prepare sparse input for model training/prediction that preserves sparsity
+    
+    Parameters:
+    -----------
+    dataframe : pandas DataFrame
+        Input data frame with original columns
+    feature_cols : list
+        List of non-encoded feature columns to use
+    categorical_encodings : list of tuples (sparse_matrix, feature_names), optional
+        Pre-encoded categorical features as sparse matrices (for test/validation data)
+    encoders : dict, optional
+        Fitted encoders to transform categorical data (needed for training data)
+        
+    Returns:
+    --------
+    X : scipy.sparse.csr_matrix
+        Sparse feature matrix suitable for training/prediction
+    feature_names : list
+        Names of all features in the same order as X
+    """
+    # Start with just the numeric features
+    X_numeric = dataframe[feature_cols].copy()
+    all_feature_names = feature_cols.copy()
+    
+    # Convert to sparse matrix
+    X_sparse = sparse.csr_matrix(X_numeric.values)
+    
+    # If we have categorical encodings, add them
+    matrices_to_combine = [X_sparse]
+    
+    if encoders:
+        # We need to transform the categorical features for this specific dataframe
+        for col, encoder in encoders.items():
+            if col in dataframe.columns:
+                encoded = encoder.transform(dataframe[[col]])
+                feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
+                matrices_to_combine.append(encoded)
+                all_feature_names.extend(feature_names)
+    
+    # Combine all matrices horizontally
+    X_combined = sparse.hstack(matrices_to_combine, format='csr')
+    return X_combined, all_feature_names
+
+# Drop original categorical columns
+df = df.drop(categorical_cols, axis=1)
 
 print("\nStep 3: Preparing Data for Modeling")
+
+print("Enhanced Anomaly Detection and Handling")
+
+# 1. Check for duplicates
+duplicate_count = df.duplicated().sum()
+print(f"Found {duplicate_count} duplicate rows")
+if duplicate_count > 0:
+    print("Removing duplicate rows...")
+    df = df.drop_duplicates()
+
+# 2. Validate logical relationships (costs vs charges)
+if all(col in df.columns for col in ['Mean Cost', 'Mean Charge']):
+    illogical_records = df[df['Mean Cost'] > df['Mean Charge']].shape[0]
+    print(f"Found {illogical_records} records where Mean Cost > Mean Charge (illogical)")
+    if illogical_records > 0:
+        # Flag these records
+        df['Illogical_Cost_Charge'] = (df['Mean Cost'] > df['Mean Charge']).astype(int)
+        # For severe cases, we could correct
+        severe_cases = df[(df['Mean Cost'] > df['Mean Charge']*1.5)]
+        print(f"  Of these, {severe_cases.shape[0]} are severe (cost > 1.5x charge)")
+        if not severe_cases.empty:
+            # For severe cases, swap the values as they were likely entered in wrong fields
+            swap_indices = severe_cases.index
+            print(f"  Swapping cost and charge values for {len(swap_indices)} severe cases")
+            df.loc[swap_indices, ['Mean Cost', 'Mean Charge']] = df.loc[swap_indices, ['Mean Charge', 'Mean Cost']].values
+
+# 3. Detect temporal disruptions (unusual YoY changes)
+for metric in ['Discharges', 'Mean Cost', 'Median Cost']:
+    if f'YoY_{metric}_Change' in df.columns:
+        # Define threshold for unusual changes (e.g., >100% increase or >50% decrease)
+        upper_threshold = 1.0  # 100% increase
+        lower_threshold = -0.5  # 50% decrease
+        unusual_increases = (df[f'YoY_{metric}_Change'] > upper_threshold).sum()
+        unusual_decreases = (df[f'YoY_{metric}_Change'] < lower_threshold).sum()
+        print(f"Unusual YoY changes in {metric}: {unusual_increases} large increases, {unusual_decreases} large decreases")
+        
+        # Flag unusual patterns
+        df[f'Unusual_{metric}_Change'] = 0
+        df.loc[df[f'YoY_{metric}_Change'] > upper_threshold, f'Unusual_{metric}_Change'] = 1
+        df.loc[df[f'YoY_{metric}_Change'] < lower_threshold, f'Unusual_{metric}_Change'] = -1
+        
+        # Winsorize extremely unusual changes to reasonable bounds
+        extreme_upper = df[f'YoY_{metric}_Change'].quantile(0.99)
+        extreme_lower = df[f'YoY_{metric}_Change'].quantile(0.01)
+        df[f'YoY_{metric}_Change'] = df[f'YoY_{metric}_Change'].clip(lower=extreme_lower, upper=extreme_upper)
+
+# 4. Handle low outliers (negative values that shouldn't be negative)
+for col in ['Discharges', 'Mean Cost', 'Median Cost', 'Mean Charge', 'Median Charge']:
+    if col in df.columns:
+        neg_values = (df[col] < 0).sum()
+        if neg_values > 0:
+            print(f"Found {neg_values} negative values in {col}")
+            # For metrics that should never be negative, replace with 0
+            df[col] = df[col].clip(lower=0)
+
+# 5. Detect coding changes in DRG codes
+if 'APR DRG Code' in df.columns and 'Year' in df.columns:
+    # Check for DRG codes that appear or disappear abruptly
+    drg_by_year = df.groupby(['Year'])['APR DRG Code'].nunique()
+    print("Number of unique DRG codes by year:")
+    print(drg_by_year)
+    
+    # Detect years with unusual changes in DRG code counts (possible coding system changes)
+    drg_count_changes = drg_by_year.pct_change()
+    unusual_years = drg_count_changes[abs(drg_count_changes) > 0.1].index.tolist()
+    if unusual_years:
+        print(f"Possible DRG coding system changes in years: {unusual_years}")
+        # Create a feature to indicate pre/post coding system change
+        latest_change_year = max(unusual_years)
+        df['Post_DRG_Change'] = (df['Year'] > latest_change_year).astype(int)
+
+# 6. Check for multimodal distributions
+# Use a simple approach - check if variance is unexpectedly high, indicating possible multimodality
+for col in ['Mean Cost', 'Median Cost', 'Mean Charge', 'Median Charge']:
+    if col in df.columns:
+        # Calculate coefficient of variation (normalized measure of dispersion)
+        cv = df[col].std() / df[col].mean()
+        print(f"Coefficient of variation for {col}: {cv:.2f}")
+        if cv > 1.0:  # Rule of thumb for high variability
+            print(f"  High variability detected in {col}, possible multimodal distribution")
+            # Create binned version of this feature to handle multimodality
+            df[f'{col}_Binned'] = pd.qcut(df[col], q=5, duplicates='drop', labels=False)
+            print(f"  Created binned feature: {col}_Binned")
 
 # Fix infinity and extremely large values before model training
 print("Checking for infinity and extreme values...")
@@ -257,7 +387,7 @@ train_df = df[df['Year'] < max_year].copy()
 test_df = df[df['Year'] == max_year].copy()
 
 # Take a smaller sample for testing
-sample_size = 10000  # Adjust as needed
+sample_size = 100000  # Reduced from 500,000 to manage memory better
 train_df = train_df.sample(n=min(len(train_df), sample_size), random_state=42)
 test_df = test_df.sample(n=min(len(test_df), sample_size), random_state=42)
 print(f"Using reduced dataset: Train={len(train_df)}, Test={len(test_df)}")
@@ -267,7 +397,7 @@ print(f"Testing data year: {test_df['Year'].unique()}")
 print(f"Train shape: {train_df.shape}, Test shape: {test_df.shape}")
 
 # Function to prepare features and target for a specific model
-def prepare_model_data(data, target_col, feature_cols=None):
+def prepare_model_data(data, target_col, feature_cols=None, encoders_dict=None):
     """
     Prepare features and target for modeling
     
@@ -279,13 +409,17 @@ def prepare_model_data(data, target_col, feature_cols=None):
         Column name of the target variable
     feature_cols : list, optional
         List of feature columns to use. If None, use all appropriate columns.
+    encoders_dict : dict, optional
+        Dictionary of fitted encoders for categorical features
         
     Returns:
     --------
-    X : pandas DataFrame
-        Features
+    X : scipy.sparse.csr_matrix
+        Features as sparse matrix
     y : pandas Series
         Target
+    feature_names : list
+        Names of all features in order
     """
     # If feature columns not specified, use all appropriate columns
     if feature_cols is None:
@@ -293,11 +427,13 @@ def prepare_model_data(data, target_col, feature_cols=None):
         exclude_cols = [target_col, 'Facility Name', 'Facility_DRG_Key', 'Year_Cat']
         feature_cols = [col for col in data.columns if col not in exclude_cols]
     
-    # Extract features and target
-    X = data[feature_cols].copy()
+    # Extract target
     y = data[target_col].copy()
     
-    return X, y
+    # Prepare sparse input features, using encoders to transform this specific dataframe
+    X, feature_names = prepare_sparse_input(data, feature_cols, encoders=encoders_dict)
+    
+    return X, y, feature_names
 
 print("\nTask 1: Predict Hospital & DRG Specific Metrics for Next Year")
 
@@ -306,20 +442,26 @@ print("\nModel 1a: Predicting Discharges")
 # Get all numeric features that don't include the target
 exclude_cols = ['Discharges', 'Mean Cost', 'Median Cost', 'Mean Charge', 'Median Charge', 'Facility Name', 'Facility_DRG_Key', 'Year_Cat']
 include_cols = [col for col in df.columns if col not in exclude_cols and col != 'Discharges']
-X_train_1a, y_train_1a = prepare_model_data(train_df, 'Discharges', include_cols)
-X_test_1a, y_test_1a = prepare_model_data(test_df, 'Discharges', include_cols)
+X_train_1a, y_train_1a, feature_names_1a = prepare_model_data(train_df, 'Discharges', include_cols, encoders)
+X_test_1a, y_test_1a, _ = prepare_model_data(test_df, 'Discharges', include_cols, encoders)
+
+# Convert to dense arrays for HistGradientBoostingRegressor which doesn't accept sparse inputs
+print("Converting sparse matrices to dense arrays...")
+X_train_1a_dense = X_train_1a.toarray()
+X_test_1a_dense = X_test_1a.toarray()
 
 # Train Gradient Boosting model for Discharges
-model_1a = GradientBoostingRegressor(
-    n_estimators=100,
+model_1a = HistGradientBoostingRegressor(
+    max_iter=100,
     learning_rate=0.1,
-    max_depth=5,
-    random_state=42
+    max_depth=5, 
+    random_state=42,
+    categorical_features=None,  # Auto-detection for sparse matrices
 )
-model_1a.fit(X_train_1a, y_train_1a)
+model_1a.fit(X_train_1a_dense, y_train_1a)
 
 # Make predictions
-y_pred_1a = model_1a.predict(X_test_1a)
+y_pred_1a = model_1a.predict(X_test_1a_dense)
 
 # Evaluate the model
 mse_1a = mean_squared_error(y_test_1a, y_pred_1a)
@@ -333,20 +475,25 @@ print(f"Discharges Prediction - RMSE: {rmse_1a:.2f}, MAE: {mae_1a:.2f}, R²: {r2
 print("\nModel 1b: Predicting Median Costs")
 # Include Discharges as a feature for cost prediction
 include_cols_1b = include_cols + ['Discharges']
-X_train_1b, y_train_1b = prepare_model_data(train_df, 'Median Cost', include_cols_1b)
-X_test_1b, y_test_1b = prepare_model_data(test_df, 'Median Cost', include_cols_1b)
+X_train_1b, y_train_1b, feature_names_1b = prepare_model_data(train_df, 'Median Cost', include_cols_1b, encoders)
+X_test_1b, y_test_1b, _ = prepare_model_data(test_df, 'Median Cost', include_cols_1b, encoders)
+
+# Convert to dense arrays
+X_train_1b_dense = X_train_1b.toarray()
+X_test_1b_dense = X_test_1b.toarray()
 
 # Train Gradient Boosting model for Median Costs
-model_1b = GradientBoostingRegressor(
-    n_estimators=100,
+model_1b = HistGradientBoostingRegressor(
+    max_iter=100,
     learning_rate=0.1,
     max_depth=5,
-    random_state=42
+    random_state=42,
+    categorical_features=None,  # Auto-detection for sparse matrices
 )
-model_1b.fit(X_train_1b, y_train_1b)
+model_1b.fit(X_train_1b_dense, y_train_1b)
 
 # Make predictions
-y_pred_1b = model_1b.predict(X_test_1b)
+y_pred_1b = model_1b.predict(X_test_1b_dense)
 
 # Evaluate the model
 mse_1b = mean_squared_error(y_test_1b, y_pred_1b)
@@ -360,20 +507,25 @@ print(f"Median Costs Prediction - RMSE: {rmse_1b:.2f}, MAE: {mae_1b:.2f}, R²: {
 print("\nModel 1c: Predicting Median Charges")
 # Include Discharges and Median Cost as features for charge prediction
 include_cols_1c = include_cols + ['Discharges', 'Median Cost'] 
-X_train_1c, y_train_1c = prepare_model_data(train_df, 'Median Charge', include_cols_1c)
-X_test_1c, y_test_1c = prepare_model_data(test_df, 'Median Charge', include_cols_1c)
+X_train_1c, y_train_1c, feature_names_1c = prepare_model_data(train_df, 'Median Charge', include_cols_1c, encoders)
+X_test_1c, y_test_1c, _ = prepare_model_data(test_df, 'Median Charge', include_cols_1c, encoders)
+
+# Convert to dense arrays
+X_train_1c_dense = X_train_1c.toarray()
+X_test_1c_dense = X_test_1c.toarray()
 
 # Train Gradient Boosting model for Median Charges
-model_1c = GradientBoostingRegressor(
-    n_estimators=100,
+model_1c = HistGradientBoostingRegressor(
+    max_iter=100,
     learning_rate=0.1,
     max_depth=5,
-    random_state=42
+    random_state=42,
+    categorical_features=None,  # Auto-detection for sparse matrices
 )
-model_1c.fit(X_train_1c, y_train_1c)
+model_1c.fit(X_train_1c_dense, y_train_1c)
 
 # Make predictions
-y_pred_1c = model_1c.predict(X_test_1c)
+y_pred_1c = model_1c.predict(X_test_1c_dense)
 
 # Evaluate the model
 mse_1c = mean_squared_error(y_test_1c, y_pred_1c)
@@ -393,7 +545,9 @@ drg_yearly.rename(columns={'Discharges': 'Total_Discharges'}, inplace=True)
 drg_yearly = drg_yearly.sort_values(['APR DRG Code', 'Year'])
 drg_yearly['Prev_Year_Discharges'] = drg_yearly.groupby('APR DRG Code')['Total_Discharges'].shift(1)
 drg_yearly['YoY_Change'] = (drg_yearly['Total_Discharges'] - drg_yearly['Prev_Year_Discharges']) / drg_yearly['Prev_Year_Discharges']
-drg_yearly.fillna(0, inplace=True)
+# Only fill NaN values in numeric columns, not categorical
+drg_yearly['Prev_Year_Discharges'] = drg_yearly['Prev_Year_Discharges'].fillna(0)
+drg_yearly['YoY_Change'] = drg_yearly['YoY_Change'].fillna(0)
 
 # Split into train and test sets
 drg_train = drg_yearly[drg_yearly['Year'] < max_year]
@@ -418,11 +572,12 @@ X_test_2 = drg_test[drg_features]
 y_test_2 = drg_test['Total_Discharges']
 
 # Train model
-model_2 = GradientBoostingRegressor(
-    n_estimators=100,
+model_2 = HistGradientBoostingRegressor(
+    max_iter=100,
     learning_rate=0.1,
     max_depth=5,
-    random_state=42
+    random_state=42,
+    categorical_features=None,  # Auto-detection for sparse matrices
 )
 model_2.fit(X_train_2, y_train_2)
 
@@ -442,20 +597,25 @@ print("\nTask 3: Predict Mean Cost per Discharge")
 # Prepare features - exclude other cost/charge metrics
 exclude_cols_3 = ['Mean Cost', 'Median Cost', 'Mean Charge', 'Median Charge', 'Facility Name', 'Facility_DRG_Key', 'Year_Cat']
 include_cols_3 = [col for col in df.columns if col not in exclude_cols_3]
-X_train_3, y_train_3 = prepare_model_data(train_df, 'Mean Cost', include_cols_3)
-X_test_3, y_test_3 = prepare_model_data(test_df, 'Mean Cost', include_cols_3)
+X_train_3, y_train_3, feature_names_3 = prepare_model_data(train_df, 'Mean Cost', include_cols_3, encoders)
+X_test_3, y_test_3, _ = prepare_model_data(test_df, 'Mean Cost', include_cols_3, encoders)
+
+# Convert to dense arrays
+X_train_3_dense = X_train_3.toarray()
+X_test_3_dense = X_test_3.toarray()
 
 # Train model
-model_3 = GradientBoostingRegressor(
-    n_estimators=100,
+model_3 = HistGradientBoostingRegressor(
+    max_iter=100,
     learning_rate=0.1,
     max_depth=5,
-    random_state=42
+    random_state=42,
+    categorical_features=None,  # Auto-detection for sparse matrices
 )
-model_3.fit(X_train_3, y_train_3)
+model_3.fit(X_train_3_dense, y_train_3)
 
 # Make predictions
-y_pred_3 = model_3.predict(X_test_3)
+y_pred_3 = model_3.predict(X_test_3_dense)
 
 # Evaluate model
 mse_3 = mean_squared_error(y_test_3, y_pred_3)
@@ -468,29 +628,40 @@ print(f"Mean Cost Prediction - RMSE: {rmse_3:.2f}, MAE: {mae_3:.2f}, R²: {r2_3:
 print("\nStep 4: Model Evaluation & Interpretation")
 
 # Feature importance for all models
-plt.figure(figsize=(12, 16))
+plt.figure(figsize=(12, 8))
 
-plt.subplot(3, 1, 1)
+# Use simplified feature importance calculation - avoid permutation importance which is memory intensive
+print("Calculating simplified feature importance...")
+
+# Calculate basic feature importance for model 1a
+importance_1a = np.zeros(len(feature_names_1a))
+# Extract feature importance if available, otherwise leave zeros
+if hasattr(model_1a, 'feature_importances_'):
+    importance_1a = model_1a.feature_importances_
+# Get top 10 features by importance
+top_idx_1a = np.argsort(importance_1a)[-10:]
 feature_importance_1a = pd.DataFrame({
-    'Feature': X_train_1a.columns,
-    'Importance': model_1a.feature_importances_
-}).sort_values('Importance', ascending=False).head(10)
+    'Feature': [feature_names_1a[i] for i in top_idx_1a],
+    'Importance': importance_1a[top_idx_1a]
+})
+
+plt.subplot(2, 1, 1)
 sns.barplot(x='Importance', y='Feature', data=feature_importance_1a)
 plt.title('Feature Importance for Discharges Model')
 
-plt.subplot(3, 1, 2)
-feature_importance_1b = pd.DataFrame({
-    'Feature': X_train_1b.columns,
-    'Importance': model_1b.feature_importances_
-}).sort_values('Importance', ascending=False).head(10)
-sns.barplot(x='Importance', y='Feature', data=feature_importance_1b)
-plt.title('Feature Importance for Median Cost Model')
-
-plt.subplot(3, 1, 3)
+# Calculate basic feature importance for model 3
+importance_3 = np.zeros(len(feature_names_3))
+# Extract feature importance if available, otherwise leave zeros
+if hasattr(model_3, 'feature_importances_'):
+    importance_3 = model_3.feature_importances_
+# Get top 10 features by importance
+top_idx_3 = np.argsort(importance_3)[-10:]
 feature_importance_3 = pd.DataFrame({
-    'Feature': X_train_3.columns,
-    'Importance': model_3.feature_importances_
-}).sort_values('Importance', ascending=False).head(10)
+    'Feature': [feature_names_3[i] for i in top_idx_3],
+    'Importance': importance_3[top_idx_3]
+})
+
+plt.subplot(2, 1, 2)
 sns.barplot(x='Importance', y='Feature', data=feature_importance_3)
 plt.title('Feature Importance for Mean Cost Model')
 
@@ -498,65 +669,92 @@ plt.tight_layout()
 plt.savefig('feature_importance.png')
 print("Feature importance plots saved to 'feature_importance.png'")
 
-# SHAP values for model explanation
-print("\nCalculating SHAP values for model interpretation...")
+print("\nPerforming optimized SHAP analysis on very small subset...")
+
+# Helper function to clean up memory
+def clean_memory():
+    """Force garbage collection to free memory"""
+    import gc
+    gc.collect()
 
 try:
-    # SHAP for Discharges model - using smaller sample
-    print("Calculating SHAP values for discharges model...")
-    # Check if DataFrame or numpy array
-    if hasattr(X_test_1a, 'iloc'):
-        X_test_sample = X_test_1a.iloc[:1000]  # Sample for SHAP analysis
-        X_train_sample = X_train_1a.iloc[:1000]
-    else:
-        X_test_sample = X_test_1a[:1000]
-        X_train_sample = X_train_1a[:1000]
+    # SHAP for Discharges model - using extremely small sample
+    print("Calculating SHAP values for discharges model (small subset)...")
     
-    explainer_1a = shap.Explainer(model_1a, X_train_sample)
-    shap_values_1a = explainer_1a(X_test_sample)
+    # Select a very small random sample (500 instances)
+    tiny_sample_size = 500
+    sample_idx = np.random.choice(X_test_1a_dense.shape[0], size=min(tiny_sample_size, X_test_1a_dense.shape[0]), replace=False)
     
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values_1a, X_test_sample, plot_type="bar", show=False)
-    plt.title("SHAP Feature Importance for Discharges Model")
+    # Use the FULL feature set, not just top features
+    X_test_tiny = X_test_1a_dense[sample_idx]
+    
+    # Create explainer with very small background set
+    background = X_test_tiny[:100]  # Just 100 background samples
+    explainer_1a = shap.Explainer(model_1a.predict, background)
+    
+    # Calculate SHAP values only on this tiny subset
+    shap_values_1a = explainer_1a(X_test_tiny)
+    
+    # 6. Create plot - but focus on top 10 features only
+    plt.figure(figsize=(10, 6))
+    # Set feature names for all features
+    shap_values_1a.feature_names = feature_names_1a
+    # Show only top features in the plot
+    shap.summary_plot(shap_values_1a, X_test_tiny, plot_type="bar", max_display=10, show=False)
+    plt.title("SHAP Feature Importance for Discharges Model (Top Features)")
     plt.tight_layout()
     plt.savefig('shap_discharges.png')
     print("SHAP plot for discharges saved")
+    
+    # Clean up memory
+    del X_test_tiny, shap_values_1a, explainer_1a, background
+    clean_memory()
+    
 except Exception as e:
     print(f"Error in SHAP analysis for Discharges: {e}")
     print("Continuing with next steps...")
 
 try:
     # SHAP for Mean Cost model
-    print("Calculating SHAP values for mean cost model...")
-    # Check if DataFrame or numpy array
-    if hasattr(X_test_3, 'iloc'):
-        X_test_sample = X_test_3.iloc[:1000]  # Sample for SHAP analysis
-        X_train_sample = X_train_3.iloc[:1000]
-    else:
-        X_test_sample = X_test_3[:1000]
-        X_train_sample = X_train_3[:1000]
+    print("Calculating SHAP values for mean cost model (small subset)...")
     
-    explainer_3 = shap.Explainer(model_3, X_train_sample)
-    shap_values_3 = explainer_3(X_test_sample)
+    # Select a very small random sample (500 instances)
+    tiny_sample_size = 500
+    sample_idx = np.random.choice(X_test_3_dense.shape[0], size=min(tiny_sample_size, X_test_3_dense.shape[0]), replace=False)
     
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values_3, X_test_sample, plot_type="bar", show=False)
-    plt.title("SHAP Feature Importance for Mean Cost Model")
+    # Use the FULL feature set, not just top features
+    X_test_tiny = X_test_3_dense[sample_idx]
+    
+    # Create explainer with very small background set
+    background = X_test_tiny[:100]  # Just 100 background samples
+    explainer_3 = shap.Explainer(model_3.predict, background)
+    
+    # Calculate SHAP values only on this tiny subset
+    shap_values_3 = explainer_3(X_test_tiny)
+    
+    # Create plot - but focus on top 10 features only
+    plt.figure(figsize=(10, 6))
+    # Set feature names for all features
+    shap_values_3.feature_names = feature_names_3
+    # Show only top features in the plot
+    shap.summary_plot(shap_values_3, X_test_tiny, plot_type="bar", max_display=10, show=False)
+    plt.title("SHAP Feature Importance for Mean Cost Model (Top Features)")
     plt.tight_layout()
     plt.savefig('shap_mean_cost.png')
     print("SHAP plot for mean cost saved")
+    
+    # Clean up memory
+    del X_test_tiny, shap_values_3, explainer_3, background
+    clean_memory()
+    
 except Exception as e:
     print(f"Error in SHAP analysis for Mean Cost: {e}")
     print("Continuing with next steps...")
 
 print("\nStep 5: Forecasting for Next Year")
 
-# Identify the next year for prediction
-next_year = max_year + 1
-print(f"Forecasting for year: {next_year}")
-
 # Create a function to prepare data for the next year prediction
-def prepare_forecast_data(df, year, features):
+def prepare_forecast_data(df, year, feature_cols, encoders_dict):
     """
     Prepare data for forecasting the next year
     
@@ -566,13 +764,15 @@ def prepare_forecast_data(df, year, features):
         Original dataset
     year : int
         Current year to base predictions on
-    features : list
-        List of features required by the model
+    feature_cols : list
+        List of feature columns to use
+    encoders_dict : dict
+        Dictionary of encoders for categorical features
         
     Returns:
     --------
-    forecast_df : pandas DataFrame
-        Data prepared for forecasting
+    forecast_df : numpy.ndarray
+        Dense array prepared for forecasting
     """
     # Filter data for the current year
     current_year_data = df[df['Year'] == year].copy()
@@ -581,36 +781,50 @@ def prepare_forecast_data(df, year, features):
     current_year_data['Year'] = year + 1
     
     # We'll need to update YoY features if we have them
-    yoy_cols = [col for col in current_year_data.columns if 'YoY' in col]
+    yoy_cols = [col for col in feature_cols if 'YoY' in col and col in current_year_data.columns]
     for col in yoy_cols:
         # For simplicity, we'll use the average of YoY changes from recent years
         avg_yoy = df[df['Year'] >= year - 2][col].mean()
         current_year_data[col] = avg_yoy
     
-    # Return only the features needed for prediction
-    return current_year_data[features]
+    # Only include the exact feature columns used for training
+    current_year_data_subset = current_year_data[feature_cols].copy()
+    
+    # Process with our data preparation functions and convert to dense
+    X, _ = prepare_sparse_input(current_year_data_subset, feature_cols, encoders=encoders_dict)
+    return X.toarray()
+
+# Identify the next year for prediction
+next_year = max_year + 1
+print(f"Forecasting for year: {next_year}")
 
 # Task 1a: Predict Discharges for next year
-X_test_1a_cols = X_test_1a.columns.tolist()
-forecast_data_1a = prepare_forecast_data(df, max_year, X_test_1a_cols)
+# Get the exact feature columns used for model 1a
+model_1a_feature_cols = include_cols.copy()
+forecast_data_1a = prepare_forecast_data(df, max_year, model_1a_feature_cols, encoders)
+# Verify dimensions match training data
+print(f"Model 1a: forecast_data has {forecast_data_1a.shape[1]} features, model expects {X_train_1a_dense.shape[1]} features")
 forecast_discharges = model_1a.predict(forecast_data_1a)
 
 # Create a working copy of the test dataframe to update with predictions
 forecast_df = test_df.copy()
 forecast_df['Year'] = next_year
-forecast_df['Discharges'] = model_1a.predict(X_test_1a)  # Updated with predicted discharges
+forecast_df['Discharges'] = model_1a.predict(X_test_1a_dense)  # Updated with predicted discharges
 
 # Task 1b: Predict Median Costs for next year
-X_test_1b_cols = X_test_1b.columns.tolist()
-forecast_data_1b = prepare_forecast_data(df, max_year, X_test_1b_cols)
-forecast_data_1b['Discharges'] = forecast_discharges  # Use the predicted discharges
+# Get the exact feature columns used for model 1b
+model_1b_feature_cols = include_cols_1b.copy()
+forecast_data_1b = prepare_forecast_data(df, max_year, model_1b_feature_cols, encoders)
+# Verify dimensions match training data
+print(f"Model 1b: forecast_data has {forecast_data_1b.shape[1]} features, model expects {X_train_1b_dense.shape[1]} features")
 forecast_median_costs = model_1b.predict(forecast_data_1b)
 
 # Task 1c: Predict Median Charges for next year
-X_test_1c_cols = X_test_1c.columns.tolist()
-forecast_data_1c = prepare_forecast_data(df, max_year, X_test_1c_cols)
-forecast_data_1c['Discharges'] = forecast_discharges  # Use the predicted discharges
-forecast_data_1c['Median Cost'] = forecast_median_costs  # Use the predicted median costs
+# Get the exact feature columns used for model 1c
+model_1c_feature_cols = include_cols_1c.copy()
+forecast_data_1c = prepare_forecast_data(df, max_year, model_1c_feature_cols, encoders)
+# Verify dimensions match training data
+print(f"Model 1c: forecast_data has {forecast_data_1c.shape[1]} features, model expects {X_train_1c_dense.shape[1]} features")
 forecast_median_charges = model_1c.predict(forecast_data_1c)
 
 # Task 2: Predict total DRG discharges for next year
@@ -622,9 +836,11 @@ forecast_data_2 = drg_test_next_year[X_test_2.columns]
 forecast_total_drg = model_2.predict(forecast_data_2)
 
 # Task 3: Predict Mean Cost per Discharge for next year
-X_test_3_cols = X_test_3.columns.tolist()
-forecast_data_3 = prepare_forecast_data(df, max_year, X_test_3_cols)
-forecast_data_3['Discharges'] = forecast_discharges  # Use the predicted discharges
+# Get the exact feature columns used for model 3
+model_3_feature_cols = include_cols_3.copy()
+forecast_data_3 = prepare_forecast_data(df, max_year, model_3_feature_cols, encoders)
+# Verify dimensions match training data
+print(f"Model 3: forecast_data has {forecast_data_3.shape[1]} features, model expects {X_train_3_dense.shape[1]} features")
 forecast_mean_costs = model_3.predict(forecast_data_3)
 
 print("\nStep 6: Documentation & Results")
