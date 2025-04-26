@@ -216,6 +216,9 @@ for i, col in enumerate(categorical_cols):
 # Create a DataFrame with the encoded features
 encoded_df = pd.DataFrame(encoded_cats, columns=feature_names, index=df.index)
 
+# Save original columns needed for task 2 before encoding
+df_orig = df[['APR DRG Code', 'Year', 'Discharges']].copy()
+
 # Concatenate the original DataFrame with the encoded features
 df = pd.concat([df.drop(categorical_cols, axis=1), encoded_df], axis=1)
 
@@ -252,6 +255,12 @@ for col in numeric_cols:
 max_year = df['Year'].max()
 train_df = df[df['Year'] < max_year].copy()
 test_df = df[df['Year'] == max_year].copy()
+
+# Take a smaller sample for testing
+sample_size = 10000  # Adjust as needed
+train_df = train_df.sample(n=min(len(train_df), sample_size), random_state=42)
+test_df = test_df.sample(n=min(len(test_df), sample_size), random_state=42)
+print(f"Using reduced dataset: Train={len(train_df)}, Test={len(test_df)}")
 
 print(f"Training data years: {train_df['Year'].min()} to {train_df['Year'].max()}")
 print(f"Testing data year: {test_df['Year'].unique()}")
@@ -376,8 +385,8 @@ print(f"Median Charges Prediction - RMSE: {rmse_1c:.2f}, MAE: {mae_1c:.2f}, R²:
 
 print("\nTask 2: Predict Total Expected Discharges by DRG Type")
 
-# Aggregate data by DRG Code and Year
-drg_yearly = df.groupby(['APR DRG Code', 'Year'])['Discharges'].sum().reset_index()
+# Aggregate data by DRG Code and Year - using the original copy of the data
+drg_yearly = df_orig.groupby(['APR DRG Code', 'Year'])['Discharges'].sum().reset_index()
 drg_yearly.rename(columns={'Discharges': 'Total_Discharges'}, inplace=True)
 
 # Create feature for previous year's discharges
@@ -492,27 +501,53 @@ print("Feature importance plots saved to 'feature_importance.png'")
 # SHAP values for model explanation
 print("\nCalculating SHAP values for model interpretation...")
 
-# SHAP for Discharges model
-explainer_1a = shap.Explainer(model_1a, X_train_1a)
-shap_values_1a = explainer_1a(X_test_1a)
+try:
+    # SHAP for Discharges model - using smaller sample
+    print("Calculating SHAP values for discharges model...")
+    # Check if DataFrame or numpy array
+    if hasattr(X_test_1a, 'iloc'):
+        X_test_sample = X_test_1a.iloc[:1000]  # Sample for SHAP analysis
+        X_train_sample = X_train_1a.iloc[:1000]
+    else:
+        X_test_sample = X_test_1a[:1000]
+        X_train_sample = X_train_1a[:1000]
+    
+    explainer_1a = shap.Explainer(model_1a, X_train_sample)
+    shap_values_1a = explainer_1a(X_test_sample)
+    
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values_1a, X_test_sample, plot_type="bar", show=False)
+    plt.title("SHAP Feature Importance for Discharges Model")
+    plt.tight_layout()
+    plt.savefig('shap_discharges.png')
+    print("SHAP plot for discharges saved")
+except Exception as e:
+    print(f"Error in SHAP analysis for Discharges: {e}")
+    print("Continuing with next steps...")
 
-plt.figure(figsize=(10, 8))
-shap.summary_plot(shap_values_1a, X_test_1a, plot_type="bar", show=False)
-plt.title("SHAP Feature Importance for Discharges Model")
-plt.tight_layout()
-plt.savefig('shap_discharges.png')
-
-# SHAP for Mean Cost model
-explainer_3 = shap.Explainer(model_3, X_train_3)
-shap_values_3 = explainer_3(X_test_3)
-
-plt.figure(figsize=(10, 8))
-shap.summary_plot(shap_values_3, X_test_3, plot_type="bar", show=False)
-plt.title("SHAP Feature Importance for Mean Cost Model")
-plt.tight_layout()
-plt.savefig('shap_mean_cost.png')
-
-print("SHAP plots saved to 'shap_discharges.png' and 'shap_mean_cost.png'")
+try:
+    # SHAP for Mean Cost model
+    print("Calculating SHAP values for mean cost model...")
+    # Check if DataFrame or numpy array
+    if hasattr(X_test_3, 'iloc'):
+        X_test_sample = X_test_3.iloc[:1000]  # Sample for SHAP analysis
+        X_train_sample = X_train_3.iloc[:1000]
+    else:
+        X_test_sample = X_test_3[:1000]
+        X_train_sample = X_train_3[:1000]
+    
+    explainer_3 = shap.Explainer(model_3, X_train_sample)
+    shap_values_3 = explainer_3(X_test_sample)
+    
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values_3, X_test_sample, plot_type="bar", show=False)
+    plt.title("SHAP Feature Importance for Mean Cost Model")
+    plt.tight_layout()
+    plt.savefig('shap_mean_cost.png')
+    print("SHAP plot for mean cost saved")
+except Exception as e:
+    print(f"Error in SHAP analysis for Mean Cost: {e}")
+    print("Continuing with next steps...")
 
 print("\nStep 5: Forecasting for Next Year")
 
