@@ -292,20 +292,20 @@ encoders = {}
 for col in categorical_cols:
     try:
         # Convert categorical variables to string type to prevent encoding issues
-        # Use sparse matrices to save memory
+    # Use sparse matrices to save memory
         encoder = OneHotEncoder(sparse_output=True, drop='first', handle_unknown='ignore', dtype=np.float64)
         # Ensure input is properly formatted as strings
         input_data = df[[col]].astype(str)
         encoded = encoder.fit_transform(input_data)
-        
-        # Create feature names
-        feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
-        
-        # Keep track of the encoder for future predictions
-        encoders[col] = encoder
-        
-        # Instead of creating a DataFrame, keep as sparse matrix with feature names
-        encoded_dfs.append((encoded, feature_names))
+    
+    # Create feature names
+    feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
+    
+    # Keep track of the encoder for future predictions
+    encoders[col] = encoder
+    
+    # Instead of creating a DataFrame, keep as sparse matrix with feature names
+    encoded_dfs.append((encoded, feature_names))
     except Exception as e:
         print(f"Error encoding categorical column {col}: {e}")
         continue
@@ -367,9 +367,9 @@ def prepare_sparse_input(dataframe, feature_cols, categorical_encodings=None, en
                         # Convert existing sparse matrix to float64
                         encoded = encoded.astype(np.float64)
                     
-                    feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
-                    matrices_to_combine.append(encoded)
-                    all_feature_names.extend(feature_names)
+                feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
+                matrices_to_combine.append(encoded)
+                all_feature_names.extend(feature_names)
                 except Exception as e:
                     print(f"Error encoding {col}: {e}")
                     # Skip this encoder if there's an error
@@ -378,7 +378,7 @@ def prepare_sparse_input(dataframe, feature_cols, categorical_encodings=None, en
     # Combine all matrices horizontally - ensure all have same data type
     try:
         X_combined = sparse.hstack(matrices_to_combine, format='csr', dtype=np.float64)
-        return X_combined, all_feature_names
+    return X_combined, all_feature_names
     except ValueError as e:
         print(f"Error combining matrices: {e}")
         # For debugging, print data types of all matrices
@@ -603,7 +603,7 @@ def train_model(X_train, y_train, X_test, y_test, model_name, prevent_leakage_fe
             learning_rate=0.05,
             max_depth=8,
             l2_regularization=0.1,
-            random_state=42,
+    random_state=42,
             categorical_features=None,
         )
     
@@ -615,17 +615,83 @@ def train_model(X_train, y_train, X_test, y_test, model_name, prevent_leakage_fe
     
     return model, y_pred, rmse, mae, r2, X_train_model, X_test_model
 
-def generate_shap_plots(model, X_test, feature_names, model_name, max_display=10, sample_size=500):
+def generate_shap_plots(model, X_test, feature_names, model_name, max_display=10, sample_size=300):
     """Generate SHAP summary and dependence plots for model interpretability"""
     print(f"\nGenerating SHAP plots for {model_name}...")
     
     try:
-        # Simplified approach - skip SHAP for complex samples
-        print(f"Skipping detailed SHAP analysis for {model_name} to save time")
+        # Make sure we're working with numpy arrays
+        if isinstance(X_test, pd.DataFrame):
+            feature_names = X_test.columns.tolist()
+            X_sample = X_test.values
+        else:
+            X_sample = X_test
         
-        # Create a simplified feature importance plot instead
+        # Use a reasonable sample size for SHAP analysis
+        if len(X_sample) > sample_size:
+            # Take a random sample of rows (not indices)
+            sample_indices = np.random.choice(len(X_sample), size=min(sample_size, len(X_sample)), replace=False)
+            X_sample = X_sample[sample_indices]
+        
+        # Create a smaller background dataset for efficiency
+        background_size = min(100, len(X_sample))
+        background = X_sample[:background_size]
+        
+        print(f"Running SHAP analysis on {len(X_sample)} samples with {len(feature_names)} features...")
+        
+        # Create SHAP explainer - use model.predict directly
+        explainer = shap.Explainer(model.predict, background)
+        
+        # Calculate SHAP values
+        shap_values = explainer(X_sample)
+        
+        # Create SHAP summary plot
+        plt.figure(figsize=(12, 8))
+        shap.summary_plot(
+            shap_values=shap_values, 
+            features=X_sample, 
+            feature_names=feature_names,
+            max_display=min(max_display, len(feature_names)),
+            plot_type="bar",
+            show=False
+        )
+        plt.tight_layout()
+        plt.savefig(f'shap_summary_{model_name.lower().replace(" ", "_")}.png', dpi=300)
+        plt.close()
+        print(f"SHAP summary plot saved for {model_name}")
+        
+        # Find the top feature based on SHAP values
+        if len(feature_names) > 0:
+            # Calculate mean absolute SHAP values for each feature
+            mean_abs_shap = np.abs(shap_values.values).mean(0)
+            top_feature_idx = np.argmax(mean_abs_shap)
+            top_feature = feature_names[top_feature_idx]
+            
+            # Generate a dependence plot for the top feature
+            plt.figure(figsize=(10, 6))
+            shap.dependence_plot(
+                ind=top_feature_idx, 
+                shap_values=shap_values.values, 
+                features=X_sample, 
+                feature_names=feature_names,
+                show=False
+            )
+            plt.title(f"SHAP Dependence Plot for {top_feature} in {model_name}")
+            plt.tight_layout()
+            plt.savefig(f'shap_dependence_{model_name.lower().replace(" ", "_")}.png', dpi=300)
+            plt.close()
+            print(f"SHAP dependence plot saved for {model_name}")
+            
+            return top_feature
+        
+        return None
+            
+    except Exception as e:
+        print(f"Error in SHAP analysis for {model_name}: {str(e)}")
+        
+        # Fallback to model's feature_importances_ if available
         if hasattr(model, 'feature_importances_'):
-            # For tree-based models with feature_importances_
+            print(f"Using model's built-in feature importance for {model_name} instead")
             importances = model.feature_importances_
             indices = np.argsort(importances)[-10:]  # Top 10 features
             
@@ -641,12 +707,7 @@ def generate_shap_plots(model, X_test, feature_names, model_name, max_display=10
             # Return the top feature
             top_idx = indices[-1]
             return feature_names[top_idx]
-        else:
-            print(f"No feature_importances_ attribute in {model_name}")
-            return None
-            
-    except Exception as e:
-        print(f"Error in importance analysis for {model_name}: {e}")
+        
         return None
     finally:
         # Clean up memory
@@ -820,7 +881,7 @@ def run_task2_total_drg_prediction(df_orig, test_year):
         # Update train and test sets
         drg_train = drg_yearly_full[drg_yearly_full['Year'] < test_year]
         drg_test = drg_yearly_full[drg_yearly_full['Year'] == test_year]
-    except Exception as e:
+except Exception as e:
         print(f"Error in one-hot encoding DRG codes: {e}")
         print("Proceeding without DRG code encoding")
     
@@ -893,19 +954,19 @@ def prepare_forecast_data(df, year, feature_cols, encoders_dict=None):
     """
     # Filter data for the current year
     if isinstance(df, pd.DataFrame):
-        current_year_data = df[df['Year'] == year].copy()
-        
-        # Update year to next year
-        current_year_data['Year'] = year + 1
-        
-        # We'll need to update YoY features if we have them
-        yoy_cols = [col for col in feature_cols if 'YoY' in col and col in current_year_data.columns]
-        for col in yoy_cols:
-            # For simplicity, we'll use the average of YoY changes from recent years
-            avg_yoy = df[df['Year'] >= year - 2][col].mean()
-            current_year_data[col] = avg_yoy
-        
-        # Only include the exact feature columns used for training
+    current_year_data = df[df['Year'] == year].copy()
+    
+    # Update year to next year
+    current_year_data['Year'] = year + 1
+    
+    # We'll need to update YoY features if we have them
+    yoy_cols = [col for col in feature_cols if 'YoY' in col and col in current_year_data.columns]
+    for col in yoy_cols:
+        # For simplicity, we'll use the average of YoY changes from recent years
+        avg_yoy = df[df['Year'] >= year - 2][col].mean()
+        current_year_data[col] = avg_yoy
+    
+    # Only include the exact feature columns used for training
         # Ensure all columns in feature_cols exist in the dataframe
         existing_cols = [col for col in feature_cols if col in current_year_data.columns]
         missing_cols = set(feature_cols) - set(existing_cols)
@@ -916,12 +977,12 @@ def prepare_forecast_data(df, year, feature_cols, encoders_dict=None):
             for col in missing_cols:
                 current_year_data[col] = 0.0
         
-        current_year_data_subset = current_year_data[feature_cols].copy()
-        
+    current_year_data_subset = current_year_data[feature_cols].copy()
+    
         # Process with our data preparation functions and convert to dense if needed
         if encoders_dict:
-            X, _ = prepare_sparse_input(current_year_data_subset, feature_cols, encoders=encoders_dict)
-            return X.toarray()
+    X, _ = prepare_sparse_input(current_year_data_subset, feature_cols, encoders=encoders_dict)
+    return X.toarray()
         else:
             # Ensure all columns are float64
             for col in current_year_data_subset.columns:
