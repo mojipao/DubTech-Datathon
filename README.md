@@ -12,6 +12,8 @@ The SPARCS dataset contains valuable information about hospital discharges, asso
 
 These predictions can help healthcare administrators, policy makers, and insurance companies make informed decisions about resource allocation, budgeting, and healthcare planning.
 
+Slide Deck: https://docs.google.com/presentation/d/15Vw-4IU-m4RB5NFTMi5fcJU8zLfTJBHhD9eJGGSH7a4/mobilepresent?slide=id.g4dfce81f19_0_45
+
 ## Data and Methods
 
 ### Dataset
