@@ -292,20 +292,20 @@ encoders = {}
 for col in categorical_cols:
     try:
         # Convert categorical variables to string type to prevent encoding issues
-    # Use sparse matrices to save memory
+        # Use sparse matrices to save memory
         encoder = OneHotEncoder(sparse_output=True, drop='first', handle_unknown='ignore', dtype=np.float64)
         # Ensure input is properly formatted as strings
         input_data = df[[col]].astype(str)
         encoded = encoder.fit_transform(input_data)
-    
-    # Create feature names
-    feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
-    
-    # Keep track of the encoder for future predictions
-    encoders[col] = encoder
-    
-    # Instead of creating a DataFrame, keep as sparse matrix with feature names
-    encoded_dfs.append((encoded, feature_names))
+        
+        # Create feature names
+        feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
+        
+        # Keep track of the encoder for future predictions
+        encoders[col] = encoder
+        
+        # Instead of creating a DataFrame, keep as sparse matrix with feature names
+        encoded_dfs.append((encoded, feature_names))
     except Exception as e:
         print(f"Error encoding categorical column {col}: {e}")
         continue
@@ -367,9 +367,9 @@ def prepare_sparse_input(dataframe, feature_cols, categorical_encodings=None, en
                         # Convert existing sparse matrix to float64
                         encoded = encoded.astype(np.float64)
                     
-                feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
-                matrices_to_combine.append(encoded)
-                all_feature_names.extend(feature_names)
+                    feature_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
+                    matrices_to_combine.append(encoded)
+                    all_feature_names.extend(feature_names)
                 except Exception as e:
                     print(f"Error encoding {col}: {e}")
                     # Skip this encoder if there's an error
@@ -378,7 +378,7 @@ def prepare_sparse_input(dataframe, feature_cols, categorical_encodings=None, en
     # Combine all matrices horizontally - ensure all have same data type
     try:
         X_combined = sparse.hstack(matrices_to_combine, format='csr', dtype=np.float64)
-    return X_combined, all_feature_names
+        return X_combined, all_feature_names
     except ValueError as e:
         print(f"Error combining matrices: {e}")
         # For debugging, print data types of all matrices
@@ -881,7 +881,7 @@ def run_task2_total_drg_prediction(df_orig, test_year):
         # Update train and test sets
         drg_train = drg_yearly_full[drg_yearly_full['Year'] < test_year]
         drg_test = drg_yearly_full[drg_yearly_full['Year'] == test_year]
-except Exception as e:
+    except Exception as e:
         print(f"Error in one-hot encoding DRG codes: {e}")
         print("Proceeding without DRG code encoding")
     
@@ -954,19 +954,19 @@ def prepare_forecast_data(df, year, feature_cols, encoders_dict=None):
     """
     # Filter data for the current year
     if isinstance(df, pd.DataFrame):
-    current_year_data = df[df['Year'] == year].copy()
-    
-    # Update year to next year
-    current_year_data['Year'] = year + 1
-    
-    # We'll need to update YoY features if we have them
-    yoy_cols = [col for col in feature_cols if 'YoY' in col and col in current_year_data.columns]
-    for col in yoy_cols:
-        # For simplicity, we'll use the average of YoY changes from recent years
-        avg_yoy = df[df['Year'] >= year - 2][col].mean()
-        current_year_data[col] = avg_yoy
-    
-    # Only include the exact feature columns used for training
+        current_year_data = df[df['Year'] == year].copy()
+        
+        # Update year to next year
+        current_year_data['Year'] = year + 1
+        
+        # We'll need to update YoY features if we have them
+        yoy_cols = [col for col in feature_cols if 'YoY' in col and col in current_year_data.columns]
+        for col in yoy_cols:
+            # For simplicity, we'll use the average of YoY changes from recent years
+            avg_yoy = df[df['Year'] >= year - 2][col].mean()
+            current_year_data[col] = avg_yoy
+        
+        # Only include the exact feature columns used for training
         # Ensure all columns in feature_cols exist in the dataframe
         existing_cols = [col for col in feature_cols if col in current_year_data.columns]
         missing_cols = set(feature_cols) - set(existing_cols)
@@ -977,12 +977,12 @@ def prepare_forecast_data(df, year, feature_cols, encoders_dict=None):
             for col in missing_cols:
                 current_year_data[col] = 0.0
         
-    current_year_data_subset = current_year_data[feature_cols].copy()
-    
+        current_year_data_subset = current_year_data[feature_cols].copy()
+        
         # Process with our data preparation functions and convert to dense if needed
         if encoders_dict:
-    X, _ = prepare_sparse_input(current_year_data_subset, feature_cols, encoders=encoders_dict)
-    return X.toarray()
+            X, _ = prepare_sparse_input(current_year_data_subset, feature_cols, encoders=encoders_dict)
+            return X.toarray()
         else:
             # Ensure all columns are float64
             for col in current_year_data_subset.columns:
